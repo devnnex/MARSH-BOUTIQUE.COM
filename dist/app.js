@@ -398,6 +398,10 @@ window.setInterval(refreshInventoryUpdateBadges, 60000);
 const INVENTORY_CACHE_KEY = "marsh_inventory_cache_v2";
 let inventoryRequest = null;
 let inventoryInitialLoadComplete = false;
+const pendingProductCreates = new Map();
+const resolvedPendingProductIds = new Map();
+const pendingProductVisibility = new Map();
+const inventoryUiOverrides = new Map();
 
 function readInventoryCache() {
   try {
@@ -420,8 +424,203 @@ function writeInventoryCache(data) {
   }
 }
 
+function normalizeInventoryText(value) {
+  return String(value ?? "").trim().toLocaleLowerCase("es");
+}
+
+function productMatchesPendingCreate(product, pending) {
+  return (
+    normalizeInventoryText(product?.nombre) === normalizeInventoryText(pending.product?.nombre) &&
+    normalizeInventoryText(product?.marca) === normalizeInventoryText(pending.product?.marca) &&
+    normalizeInventoryText(product?.categoria) === normalizeInventoryText(pending.product?.categoria) &&
+    parseCOPValue(product?.precio) === parseCOPValue(pending.product?.precio) &&
+    parseCOPValue(product?.costo) === parseCOPValue(pending.product?.costo)
+  );
+}
+
+function transferPendingProductState(temporaryId, realId) {
+  const temporaryKey = String(temporaryId);
+  const realKey = String(realId);
+  const selectedQuantity = Number(qtyState[temporaryKey]) || 0;
+
+  if (selectedQuantity > 0) {
+    qtyState[realKey] = Math.max(Number(qtyState[realKey]) || 0, selectedQuantity);
+  }
+  delete qtyState[temporaryKey];
+  delete stockState[temporaryKey];
+
+  sellCartState.items = sellCartState.items.map(item =>
+    String(item.id) === temporaryKey ? { ...item, id: realId } : item
+  );
+  if (String(sellState?.id) === temporaryKey) sellState.id = realId;
+
+  resolvedPendingProductIds.set(temporaryKey, realId);
+  pendingProductCreates.delete(temporaryKey);
+}
+
+function extractCreatedProductId(payload) {
+  const candidates = [
+    payload?.id,
+    payload?.productId,
+    payload?.productoId,
+    payload?.data?.id,
+    payload?.product?.id
+  ];
+  return candidates.find(value => value !== undefined && value !== null && value !== "");
+}
+
+function promotePendingProductLocally(temporaryId, realId) {
+  const currentInventory = (window.inventario || []).map(product => ({ ...product }));
+  const pendingProduct = currentInventory.find(product => String(product.id) === String(temporaryId));
+  if (!pendingProduct) return;
+
+  transferPendingProductState(temporaryId, realId);
+  const promotedInventory = currentInventory.map(product =>
+    String(product.id) === String(temporaryId)
+      ? { ...product, id: realId, __pendingCreate: false }
+      : product
+  );
+  const promotedProduct = promotedInventory.find(product => String(product.id) === String(realId));
+  if (promotedProduct) pendingProductVisibility.set(String(realId), promotedProduct);
+  writeInventoryCache(promotedInventory);
+  renderInventory(promotedInventory);
+  scheduleVisibleProductSync(realId);
+}
+
+function reconcilePendingProductCreates(serverData) {
+  const reconciled = serverData.map(product => ({ ...product }));
+
+  pendingProductCreates.forEach((pending, temporaryId) => {
+    const match = reconciled.find(product =>
+      !pending.baselineIds.has(String(product.id)) &&
+      productMatchesPendingCreate(product, pending)
+    );
+
+    if (match) {
+      transferPendingProductState(temporaryId, match.id);
+      return;
+    }
+
+    const localPending = (window.inventario || []).find(product =>
+      String(product.id) === String(temporaryId)
+    );
+    if (localPending && !reconciled.some(product => String(product.id) === String(temporaryId))) {
+      reconciled.push({ ...localPending });
+    }
+  });
+
+  pendingProductVisibility.forEach((localProduct, realId) => {
+    if (reconciled.some(product => String(product.id) === String(realId))) {
+      pendingProductVisibility.delete(String(realId));
+      return;
+    }
+    reconciled.push({ ...localProduct });
+  });
+
+  return reconciled;
+}
+
+function holdInventoryUiState(product, duration = 12000) {
+  if (!product?.id) return;
+  inventoryUiOverrides.set(String(product.id), {
+    id: product.id,
+    nombre: product.nombre,
+    marca: product.marca,
+    stock: Number(product.stock) || 0,
+    vendidos: Number(product.vendidos) || 0,
+    expiresAt: Date.now() + duration
+  });
+}
+
+function clearInventoryUiStateForSales(sales) {
+  sales.forEach(sale => {
+    const override = [...inventoryUiOverrides.values()].find(item =>
+      normalizeInventoryText(item.nombre) === normalizeInventoryText(sale.producto) &&
+      normalizeInventoryText(item.marca) === normalizeInventoryText(sale.marca)
+    );
+    if (override) inventoryUiOverrides.delete(String(override.id));
+  });
+}
+
+function applyInventoryUiOverrides(serverData) {
+  const now = Date.now();
+  return serverData.map(product => {
+    const override = inventoryUiOverrides.get(String(product.id)) ||
+      [...inventoryUiOverrides.values()].find(item =>
+        normalizeInventoryText(item.nombre) === normalizeInventoryText(product.nombre) &&
+        normalizeInventoryText(item.marca) === normalizeInventoryText(product.marca)
+      );
+
+    if (!override) return product;
+    if (override.expiresAt <= now) {
+      inventoryUiOverrides.delete(String(override.id));
+      return product;
+    }
+
+    const backendStock = Number(product.stock) || 0;
+    const backendSold = Number(product.vendidos) || 0;
+    if (backendStock === override.stock && backendSold === override.vendidos) {
+      inventoryUiOverrides.delete(String(override.id));
+      return product;
+    }
+
+    return {
+      ...product,
+      stock: override.stock,
+      cantidad: override.stock,
+      vendidos: override.vendidos
+    };
+  });
+}
+
+function schedulePendingProductSync(temporaryId, attempt = 0) {
+  if (!pendingProductCreates.has(String(temporaryId)) || attempt >= 10) return;
+  window.setTimeout(async () => {
+    await cargarInventario({ silent: true });
+    if (pendingProductCreates.has(String(temporaryId))) {
+      schedulePendingProductSync(temporaryId, attempt + 1);
+    }
+  }, Math.min(350 + attempt * 150, 1200));
+}
+
+function scheduleVisibleProductSync(realId, attempt = 0) {
+  if (!pendingProductVisibility.has(String(realId)) || attempt >= 10) return;
+  window.setTimeout(async () => {
+    await cargarInventario({ silent: true });
+    if (pendingProductVisibility.has(String(realId))) {
+      scheduleVisibleProductSync(realId, attempt + 1);
+    }
+  }, Math.min(350 + attempt * 150, 1200));
+}
+
+async function resolveProductIdForSale(id) {
+  const key = String(id);
+  if (!key.startsWith("pending-")) return id;
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 10000) {
+    const resolvedId = resolvedPendingProductIds.get(key);
+    if (resolvedId !== undefined && resolvedId !== null) return resolvedId;
+    if (!pendingProductCreates.has(key)) {
+      throw new Error("No fue posible terminar de registrar el producto");
+    }
+    await cargarInventario({ silent: true });
+    await new Promise(resolve => window.setTimeout(resolve, 180));
+  }
+
+  throw new Error("El producto todavía se está sincronizando");
+}
+
 function renderInventory(data) {
     const items = [...data];
+
+    const liveIds = new Set(items.map(product => String(product.id)));
+    Object.keys(qtyState).forEach(id => {
+      if (!liveIds.has(String(id))) delete qtyState[id];
+    });
+    Object.keys(stockState).forEach(id => {
+      if (!liveIds.has(String(id))) delete stockState[id];
+    });
 
     // 👇 GUARDAMOS INVENTARIO GLOBAL
     window.inventario = items;
@@ -555,9 +754,12 @@ async function cargarInventario({ silent = false } = {}) {
       const data = await res.json();
       if (!Array.isArray(data)) throw new Error("Respuesta de inventario inválida");
 
-      writeInventoryCache(data);
-      renderInventory(data);
-      return data;
+      const reconciledData = applyInventoryUiOverrides(
+        reconcilePendingProductCreates(data)
+      );
+      writeInventoryCache(reconciledData);
+      renderInventory(reconciledData);
+      return reconciledData;
     } catch (err) {
       console.error(err);
       if (!cached.length) showToast("Error cargando inventario");
@@ -854,6 +1056,7 @@ function restoreSalesInInventoryLocally(sales) {
     product.stock = (Number(product.stock) || 0) + quantity;
     product.cantidad = product.stock;
     product.vendidos = Math.max(0, (Number(product.vendidos) || 0) - quantity);
+    holdInventoryUiState(product);
   });
 
   writeInventoryCache(restoredInventory);
@@ -1240,8 +1443,17 @@ form.onsubmit = async e => {
     cantidad: data.cantidad,
     stock: data.cantidad,
     vendidos: Number(previousProduct?.vendidos) || 0,
-    fecha: now
+    fecha: now,
+    __pendingCreate: !isEditing
   };
+
+  if (!isEditing) {
+    pendingProductCreates.set(String(optimisticId), {
+      product: optimisticProduct,
+      baselineIds: new Set(previousInventory.map(product => String(product.id)))
+    });
+  }
+
   const optimisticInventory = isEditing
     ? previousInventory.map(product => String(product.id) === String(data.id) ? optimisticProduct : product)
     : [...previousInventory, optimisticProduct];
@@ -1270,9 +1482,18 @@ form.onsubmit = async e => {
       body: JSON.stringify(data)
     });
     if (!response.ok) throw new Error("El backend no confirmó el cambio");
+    if (!isEditing) {
+      const responsePayload = await response.clone().json().catch(() => null);
+      const createdId = extractCreatedProductId(responsePayload);
+      if (createdId !== undefined) promotePendingProductLocally(optimisticId, createdId);
+    }
     await cargarInventario({ silent: true });
+    if (!isEditing && pendingProductCreates.has(String(optimisticId))) {
+      schedulePendingProductSync(optimisticId);
+    }
   } catch (error) {
     console.error(error);
+    if (!isEditing) pendingProductCreates.delete(String(optimisticId));
     if (isEditing && previousUpdateTimestamp) {
       markProductUpdated(data.id, previousUpdateTimestamp);
     } else if (isEditing) {
@@ -1301,10 +1522,13 @@ function actualizarTotalGlobalVenta() {
     const qty = qtyState[id];
     if (!qty || qty <= 0) return;
 
-    haySeleccion = true;
-
     const row = document.querySelector(`tr[data-id="${id}"]`);
-    if (!row) return;
+    if (!row) {
+      delete qtyState[id];
+      return;
+    }
+
+    haySeleccion = true;
 
     const precio = Number(
       row.children[3].textContent.replace(/[^\d]/g, "")
@@ -1368,6 +1592,7 @@ function applyCompletedSaleToInventory(items) {
       product.stock = stockState[id];
       product.cantidad = stockState[id];
       product.vendidos = currentSold + qty;
+      holdInventoryUiState(product);
     }
 
     const counter = document.getElementById(`qty-${id}`);
@@ -1826,7 +2051,13 @@ async function confirmarVentaMultiple() {
 
     const descuento = parseCOPValue(document.getElementById("cartDiscount").value);
 
-    const items = sellCartState.items;
+    const items = await Promise.all(
+      sellCartState.items.map(async item => ({
+        ...item,
+        id: await resolveProductIdForSale(item.id)
+      }))
+    );
+    sellCartState.items = items;
 
     const totalVenta = items.reduce(
       (s, i) => s + i.precio * i.qty,
@@ -2196,8 +2427,8 @@ function updateSellCartBadge() {
 
   let totalItems = 0;
 
-  Object.values(qtyState).forEach(qty => {
-    if (qty > 0) totalItems += qty;
+  Object.entries(qtyState).forEach(([id, qty]) => {
+    if (qty > 0 && document.querySelector(`tr[data-id="${id}"]`)) totalItems += qty;
   });
 
   if (totalItems <= 0) {
@@ -2243,7 +2474,9 @@ async function confirmarVenta() {
     const monto1 = Number(document.getElementById("payAmount1").value || 0);
     const monto2 = Number(document.getElementById("payAmount2").value || 0);
 
-    const { id, nombre, marca, precio } = sellState;
+    const { nombre, marca, precio } = sellState;
+    const id = await resolveProductIdForSale(sellState.id);
+    sellState.id = id;
 
     const subtotal = precio * qty;
     const total = subtotal - descuento;
@@ -2465,6 +2698,7 @@ async function eliminarVenta(idVenta) {
 
   } catch (err) {
     console.error(err);
+    if (deletedSale) clearInventoryUiStateForSales([deletedSale]);
     salesData = previousSales;
     salesLoadedAt = Date.now();
     populateFilters(salesData);
@@ -2487,7 +2721,7 @@ window.eliminarTodasLasVentas = async function eliminarTodasLasVentas() {
   let ids = salesToDelete.map(sale => sale.id).filter(id => id !== undefined && id !== null && id !== "");
 
   // Si acaba de registrarse una venta, espera la sincronización que ya está en curso.
-  if (!ids.length) {
+  if (!ids.length && salesLoadedAt === 0) {
     const refreshedSales = await cargarVentas({ force: true, silent: true });
     salesToDelete = (Array.isArray(refreshedSales) ? refreshedSales : salesData).map(sale => ({ ...sale }));
     ids = salesToDelete.map(sale => sale.id).filter(id => id !== undefined && id !== null && id !== "");
@@ -2533,6 +2767,13 @@ window.eliminarTodasLasVentas = async function eliminarTodasLasVentas() {
         failures.push({ id, error });
       }
     });
+
+    if (failures.length) {
+      const failedIds = new Set(failures.map(failure => String(failure.id)));
+      clearInventoryUiStateForSales(
+        salesToDelete.filter(sale => failedIds.has(String(sale.id)))
+      );
+    }
 
     invalidateSalesCache();
     await Promise.all([

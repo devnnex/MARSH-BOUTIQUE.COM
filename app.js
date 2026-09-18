@@ -1439,6 +1439,7 @@ form.onsubmit = async e => {
     categoria: data.categoria,
     subcategoria: data.subcategoria,
     costo: data.costo,
+    margen: data.margen,
     precio: data.precio,
     cantidad: data.cantidad,
     stock: data.cantidad,
@@ -2572,6 +2573,8 @@ function editarProducto(id) {
   const row = document.querySelector(`tr[data-id="${id}"]`);
   if (!row) return;
 
+  const product = (window.inventario || []).find(item => String(item.id) === String(id));
+
   const modal = document.getElementById("modal");
   const form = document.getElementById("form");
 
@@ -2596,8 +2599,9 @@ function editarProducto(id) {
   // 🔹 costo real (base del cálculo)
   form.costo.value = costo ? `$ ${costo.toLocaleString("es-CO")}` : "";
 
-  // margen solo como input de cálculo
-  form.margen.value = 100;
+  // conservar el margen guardado para permitir editarlo
+  const margenGuardado = Number(product?.margen);
+  form.margen.value = Number.isFinite(margenGuardado) ? margenGuardado : 100;
 
   // 🔐 estado de edición (mínimo necesario)
   editState = {

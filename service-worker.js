@@ -1,4 +1,4 @@
-const CACHE_NAME = "marsh-shell-v11";
+const CACHE_NAME = "marsh-shell-v12";
 
 const APP_SHELL = [
   "./",
